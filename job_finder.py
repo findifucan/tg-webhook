@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-job_finder.py (updated)
-- Tries HTML scrape (existing method). If blocked (403) it falls back to Indeed RSS.
-- Saves seen IDs to seen.json and posts new jobs to webhook URL.
-- Requires: requests, beautifulsoup4, feedparser
+job_finder.py (updated: extracts likely direct apply links)
+- Multi-source: Indeed (RSS fallback), Naukri, Internshala (best-effort).
+- For each job found, fetch the job page and try to extract a direct 'apply' link.
+- Posts payload to WEBHOOK_URL with optional HMAC header X-Webhook-Signature.
 """
-
-import requests, hashlib, hmac, json, os, time
-from bs4 import BeautifulSoup
+import os, json, time, hashlib, hmac, requests
 from datetime import datetime
+from bs4 import BeautifulSoup
 
 try:
     import feedparser
@@ -17,14 +16,14 @@ except Exception:
 
 # CONFIG
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL") or "https://web-production-9ef7c3.up.railway.app/notify"
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")   # optional
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 SEEN_FILE = os.path.join(os.path.dirname(__file__), "seen.json")
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 HEADERS = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
 
-# Search targets
-HTML_SEARCH_URL = ("https://in.indeed.com/jobs?q=CEH+fresher+cyber+security&l=India&sort=date")
-RSS_SEARCH_URL = ("https://in.indeed.com/rss?q=CEH+fresher+cyber+security&l=India")
+INDEED_RSS = "https://in.indeed.com/rss?q=CEH+fresher+cyber+security&l=India"
+NAUKRI_SEARCH = "https://www.naukri.com/cyber-security-fresher-jobs-in-india"
+INTERNSHALA_SEARCH = "https://internshala.com/internships/it-software/internship"
 
 def load_seen():
     try:
@@ -42,54 +41,83 @@ def compute_hmac(body_bytes, secret):
 
 def post_to_webhook(job):
     payload = {
-        "title": job["title"],
+        "title": job.get("title",""),
         "company": job.get("company",""),
         "location": job.get("location",""),
-        "apply_link": job["link"],
+        "apply_link": job.get("apply_link", job.get("link","")),
         "description": job.get("summary",""),
         "questions":[
-            {"q":"Why are you interested in this role?","a":"(Short 1-2 line personalized answer)"},
-            {"q":"Mention CEH topics you practiced.","a":"Nmap, Burp, SQLi testing, OSINT, SIEM basics."}
+            {"q":"Why are you interested in this role?","a":"(Short personalized answer)"},
+            {"q":"Mention CEH topics you practiced.","a":"Nmap, Burp, SQLi, OSINT, SIEM basics."}
         ]
     }
     body = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type":"application/json"}
     if WEBHOOK_SECRET:
         headers["X-Webhook-Signature"] = compute_hmac(body, WEBHOOK_SECRET)
-    resp = requests.post(WEBHOOK_URL, data=body, headers=headers, timeout=20)
-    return resp
+    r = requests.post(WEBHOOK_URL, data=body, headers=headers, timeout=20)
+    return r
 
-def fetch_jobs_html():
-    r = requests.get(HTML_SEARCH_URL, headers=HEADERS, timeout=15)
-    if r.status_code == 403:
-        raise requests.HTTPError("Forbidden", response=r)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-    jobs = []
-    for card in soup.select("a.tapItem, div.job_seen_beacon"):
-        try:
-            a = card.find("a", href=True) or card
-            href = a.get("href")
-            if not href:
-                continue
-            link = "https://in.indeed.com" + href if href.startswith("/") else href
-            title = (card.select_one("h2.jobTitle") or card.select_one(".jobTitle") or card.get("aria-label") or "Job").get_text(strip=True)
-            company = (card.select_one(".companyName") or card.select_one(".company") or "") 
-            company = company.get_text(strip=True) if company else ""
-            location = (card.select_one(".companyLocation") or card.select_one(".location") or "")
-            location = location.get_text(strip=True) if location else ""
-            summary = (card.select_one(".job-snippet") or card.select_one(".summary") or "")
-            summary = summary.get_text(" ", strip=True) if summary else ""
-            job_id = hashlib.sha256(link.encode()).hexdigest()[:16]
-            jobs.append({"id":job_id,"title":title,"company":company,"location":location,"link":link,"summary":summary})
-        except Exception:
-            continue
-    return jobs
+def extract_apply_link(job_page_url):
+    """Open the job page and try heuristics to find an 'apply' link."""
+    try:
+        r = requests.get(job_page_url, headers=HEADERS, timeout=12)
+        r.raise_for_status()
+        html = r.text
+    except Exception:
+        return job_page_url  # fallback to original link
 
-def fetch_jobs_rss():
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1) Common 'apply' button selectors
+    selectors = [
+        "a.apply, a.apply-now, a.applyBtn, a.apply-button, a.btn-apply, a#apply-button",
+        "a[href*='apply'], button.apply, button[id*='apply']",
+        "a[role='button'][href*='apply']",
+    ]
+    for sel in selectors:
+        el = soup.select_one(sel)
+        if el and el.get("href"):
+            href = el.get("href").strip()
+            if href.startswith("http"):
+                return href
+            elif href.startswith("/"):
+                base = requests.utils.urlparse(job_page_url).scheme + "://" + requests.utils.urlparse(job_page_url).netloc
+                return base + href
+
+    # 2) Look for form with action including 'apply' or 'submit'
+    form = soup.find("form", action=lambda a: a and ("apply" in a or "submit" in a))
+    if form:
+        action = form.get("action")
+        if action:
+            if action.startswith("http"):
+                return action
+            if action.startswith("/"):
+                base = requests.utils.urlparse(job_page_url).scheme + "://" + requests.utils.urlparse(job_page_url).netloc
+                return base + action
+            return job_page_url
+
+    # 3) meta refresh or og:url or canonical
+    og = soup.find("meta", property="og:url")
+    if og and og.get("content"):
+        return og.get("content")
+    canon = soup.find("link", rel="canonical")
+    if canon and canon.get("href"):
+        return canon.get("href")
+
+    # 4) search for external application links (common providers)
+    for provider in ["meetanshi","apply.workable.com","lever.co","greenhouse","timesjobs","shrm","naukri.com","internshala.com","linkedin.com"]:
+        tag = soup.select_one(f"a[href*='{provider}']")
+        if tag and tag.get("href"):
+            return tag.get("href")
+
+    # no special apply link found — return original page
+    return job_page_url
+
+def parse_rss_feed(rss_url):
     if not feedparser:
         return []
-    feed = feedparser.parse(RSS_SEARCH_URL)
+    feed = feedparser.parse(rss_url)
     jobs = []
     for e in feed.entries:
         link = e.get("link")
@@ -99,40 +127,103 @@ def fetch_jobs_rss():
         jobs.append({"id":job_id,"title":title,"company":e.get("author",""),"location":"","link":link,"summary":summary})
     return jobs
 
-def fetch_jobs():
-    # try HTML first, fall back to RSS
+def parse_naukri():
     try:
-        return fetch_jobs_html()
-    except requests.HTTPError as he:
-        # Forbidden or other HTTP error -> fallback to RSS
-        print("HTML fetch failed:", he)
-        if feedparser:
-            print("Falling back to RSS...")
-            return fetch_jobs_rss()
-        else:
-            print("feedparser not installed; cannot use RSS fallback.")
-            return []
-    except Exception as e:
-        print("Fetch error:", e)
+        r = requests.get(NAUKRI_SEARCH, headers=HEADERS, timeout=12)
+        r.raise_for_status()
+    except Exception:
         return []
+    soup = BeautifulSoup(r.text, "html.parser")
+    jobs = []
+    for card in soup.select("article.jobTuple, div.jobTuple")[:40]:
+        try:
+            a = card.find("a", href=True)
+            href = a.get("href") if a else None
+            if not href:
+                continue
+            link = href if href.startswith("http") else "https://www.naukri.com" + href
+            title = (card.select_one("a.title") or card.select_one("h2") or card).get_text(strip=True)
+            company = (card.select_one(".company") or card.select_one(".companyInfo .subTitle") or "").get_text(strip=True)
+            job_id = hashlib.sha256(link.encode()).hexdigest()[:16]
+            jobs.append({"id":job_id,"title":title,"company":company,"location":"","link":link,"summary":""})
+        except Exception:
+            continue
+    return jobs
+
+def parse_internshala():
+    try:
+        r = requests.get(INTERNSHALA_SEARCH, headers=HEADERS, timeout=12)
+        r.raise_for_status()
+    except Exception:
+        return []
+    soup = BeautifulSoup(r.text, "html.parser")
+    jobs = []
+    for card in soup.select("div.internship_meta, div.item, div.internship")[:40]:
+        try:
+            title_tag = card.select_one("a.profile") or card.select_one(".heading_4_5")
+            title = title_tag.get_text(strip=True) if title_tag else card.get_text(" ", strip=True)[:80]
+            if "cyber" not in title.lower() and "security" not in title.lower():
+                continue
+            link_tag = card.find("a", href=True)
+            href = link_tag.get("href") if link_tag else None
+            if not href:
+                continue
+            link = "https://internshala.com" + href if href.startswith("/") else href
+            job_id = hashlib.sha256(link.encode()).hexdigest()[:16]
+            jobs.append({"id":job_id,"title":title,"company":"","location":"","link":link,"summary":""})
+        except Exception:
+            continue
+    return jobs
+
+def fetch_jobs():
+    jobs = []
+    # Indeed RSS first (reliable)
+    if feedparser:
+        try:
+            jobs = parse_rss_feed(INDEED_RSS)
+            if jobs:
+                return jobs
+        except Exception:
+            pass
+    # Naukri fallback
+    try:
+        naukri = parse_naukri()
+        if naukri:
+            return naukri
+    except Exception:
+        pass
+    # Internshala fallback
+    try:
+        intern = parse_internshala()
+        if intern:
+            return intern
+    except Exception:
+        pass
+    return jobs
 
 def main():
     print(f"[{datetime.utcnow().isoformat()}] Starting job check...")
     seen = load_seen()
     jobs = fetch_jobs()
+    if not jobs:
+        print("No jobs fetched.")
+        return
     new = [j for j in jobs if j["id"] not in seen]
     if not new:
         print("No new jobs.")
         return
-    for job in new[:10]:
-        print("Posting:", job["title"], job["link"])
+    for j in new[:15]:
+        print("Resolving apply link for:", j.get("title"), j.get("link"))
         try:
-            r = post_to_webhook(job)
-            print("Webhook:", r.status_code, r.text)
+            apply_link = extract_apply_link(j.get("link"))
+            j["apply_link"] = apply_link
+            r = post_to_webhook(j)
+            print("Posted:", r.status_code, r.text)
             if r.status_code == 200:
-                seen.add(job["id"])
+                seen.add(j["id"])
         except Exception as e:
             print("Post error:", e)
+        time.sleep(2)
     save_seen(seen)
     print("Done.")
 

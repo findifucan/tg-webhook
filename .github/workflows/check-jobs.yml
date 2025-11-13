@@ -2,7 +2,7 @@ name: Job Finder (CEH fresher)
 
 on:
   schedule:
-    - cron: '0 */5 * * *'
+    - cron: '0 */5 * * *'   # every 5 hours (UTC)
   workflow_dispatch: {}
 
 jobs:

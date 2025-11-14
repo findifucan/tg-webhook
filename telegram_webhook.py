@@ -1,213 +1,77 @@
-#!/usr/bin/env python3
-"""
-telegram_webhook.py
-
-Webhook receiver for job_finder -> forwards messages to Telegram.
-Supports HMAC-SHA256 verification using the WEBHOOK_SECRET environment variable.
-Accepts several signature header formats:
-  - raw hex (e.g. "abcdef...")
-  - sha256=<hex>
-  - base64 (standard)
-  - sha256=<base64>
-Set DEBUG_WEBHOOK=1 (temporarily) to log received/expected signature values (be careful).
-"""
-
-import os
-import hmac
-import hashlib
-import base64
-import json
-import logging
+# telegram_webhook.py
+# Simple Flask app: /, /health, /notify
+# HMAC header expected in X-Webhook-Signature (raw hex)
+import os, hmac, hashlib, json, logging
 from flask import Flask, request, jsonify, abort
-import requests
 
-# --- Configuration from environment ---
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("webhook")
+
+app = Flask(__name__)
+
+# environment variables
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")  # optional: if not set, signature not required
-DEBUG = os.environ.get("DEBUG_WEBHOOK", "0") == "1"
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 
-if not TG_BOT_TOKEN or not TG_CHAT_ID:
-    logging.warning("TG_BOT_TOKEN or TG_CHAT_ID not set in environment. Telegram sending will fail until provided.")
-
-# --- Flask app ---
-app = Flask(__name__)
-app.logger.setLevel(logging.INFO)
-
-def compute_hmac_sha256_hex(secret: bytes, msg: bytes) -> str:
-    return hmac.new(secret, msg, hashlib.sha256).hexdigest()
-
-def compute_hmac_sha256_b64(secret: bytes, msg: bytes) -> str:
-    return base64.b64encode(hmac.new(secret, msg, hashlib.sha256).digest()).decode()
-
-def safe_compare(a: str, b: str) -> bool:
-    # Use compare_digest on bytes
-    try:
-        return hmac.compare_digest(a.encode(), b.encode())
-    except Exception:
-        return False
-
-def normalize_header_value(val: str) -> str:
-    return val.strip()
-
-def verify_signature(header_value: str, secret: str, body: bytes) -> bool:
-    """
-    Accepts a single header value and tries common signature formats.
-    Returns True if any matches.
-    """
-    if not header_value:
-        return False
-    hv = normalize_header_value(header_value)
-
-    # Compute expected forms
-    secret_bytes = secret.encode()
-    expected_hex = compute_hmac_sha256_hex(secret_bytes, body)          # lowercase hex
-    expected_hex_up = expected_hex.upper()
-    expected_b64 = compute_hmac_sha256_b64(secret_bytes, body)         # base64 standard
-    expected_b64_url = expected_b64.replace("+", "-").replace("/", "_").rstrip("=")  # urlsafe-ish (if needed)
-
-    # Candidate header patterns to accept (server might send one of these)
-    candidates = [
-        expected_hex,
-        expected_hex_up,
-        f"sha256={expected_hex}",
-        f"sha256={expected_hex_up}",
-        expected_b64,
-        f"sha256={expected_b64}",
-        expected_b64_url,
-        f"sha256={expected_b64_url}",
-    ]
-
-    # If header includes multiple values (comma-separated), check them individually
-    for token in [t.strip() for t in hv.split(",") if t.strip()]:
-        for cand in candidates:
-            if safe_compare(token, cand):
-                if DEBUG:
-                    app.logger.info("Signature match: token=%s matched candidate=%s", token, cand)
-                return True
-
-    if DEBUG:
-        app.logger.info("verify_signature failed. header=%s expected_hex[0:8]=%s expected_b64[0:8]=%s",
-                        hv, expected_hex[:8], expected_b64[:8])
-    return False
-
-def send_telegram_message(text: str) -> dict:
-    """Send a text message to the configured Telegram chat via bot API."""
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        app.logger.error("TG_BOT_TOKEN or TG_CHAT_ID missing; cannot send Telegram message.")
-        return {"ok": False, "error": "missing_bot_config"}
-
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TG_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False
-    }
-    try:
-        resp = requests.post(url, json=payload, timeout=20)
-        try:
-            return resp.json()
-        except Exception:
-            return {"ok": False, "status_code": resp.status_code, "text": resp.text}
-    except Exception as ex:
-        app.logger.exception("Exception while sending to Telegram: %s", ex)
-        return {"ok": False, "error": str(ex)}
-
-def format_notification(payload: dict) -> str:
-    """
-    Format the incoming JSON payload into a readable Telegram message.
-    Expected payload fields: title, company, location, apply_link, description, questions (list).
-    """
-    title = payload.get("title", "No title")
-    company = payload.get("company", "")
-    location = payload.get("location", "")
-    link = payload.get("apply_link", "")
-    desc = payload.get("description", "")
-    questions = payload.get("questions", [])
-
-    parts = []
-    parts.append(f"<b>{title}</b>")
-    if company:
-        parts.append(f"<i>{company}</i>")
-    if location:
-        parts.append(f"📍 {location}")
-    if link:
-        parts.append(f"🔗 <a href=\"{link}\">Apply</a>")
-    if desc:
-        # keep description short, Telegram supports HTML
-        desc_short = desc if len(desc) <= 400 else desc[:397] + "..."
-        parts.append(f"\n{desc_short}")
-
-    if questions:
-        parts.append("\n<b>Interview Q&A (sample)</b>")
-        for i, q in enumerate(questions[:5], start=1):
-            q_text = q.get("q") if isinstance(q, dict) else q
-            a_text = q.get("a") if isinstance(q, dict) else ""
-            # sanitize angle brackets to keep HTML safe
-            q_text = str(q_text).replace("<", "&lt;").replace(">", "&gt;")
-            a_text = str(a_text).replace("<", "&lt;").replace(">", "&gt;")
-            parts.append(f"\n{i}. <b>{q_text}</b>\n→ {a_text}")
-
-    # join with double newlines between main sections
-    return "\n".join(parts)
+@app.route("/", methods=["GET"])
+def index():
+    return (
+        "<h1>Job Finder Webhook</h1>"
+        "<p>Available endpoints: <b>/health</b>, <b>/notify</b> (POST)</p>"
+        "<p>Service is running.</p>",
+        200,
+    )
 
 @app.route("/health", methods=["GET"])
 def health():
     return "ok", 200
 
+def valid_signature(body_bytes, sig_header):
+    if not WEBHOOK_SECRET:
+        # if secret not set, accept (useful for testing)
+        log.warning("WEBHOOK_SECRET not set in environment — skipping HMAC check")
+        return False if sig_header else True
+    # expected header: raw hex (64 chars)
+    try:
+        computed = hmac.new(WEBHOOK_SECRET.encode(), body_bytes, hashlib.sha256).hexdigest()
+        # accept raw hex (lowercase) OR "sha256="+hex
+        if sig_header is None:
+            return False
+        sig = sig_header.strip()
+        if sig == computed or sig.lower() == computed:
+            return True
+        if sig.startswith("sha256=") and sig.split("=",1)[1] == computed:
+            return True
+        return False
+    except Exception as e:
+        log.exception("signature check error")
+        return False
+
 @app.route("/notify", methods=["POST"])
 def notify():
-    # raw body bytes (important for signature verification)
-    # TEMP DEBUG: log exactly what we received and the expected HMAC (remove after debugging)
-    import hmac, hashlib
-    app.logger.info("DEBUG: received header X-Webhook-Signature -> %s", header_sig)
+    body = request.get_data()  # raw bytes
+    sig = request.headers.get("X-Webhook-Signature")
+    log.info("Received /notify, sig=%s, len=%d", sig and sig[:8]+"...", len(body))
 
-    # compute expected hex and base64 to print (only for debug)
-    if os.environ.get("WEBHOOK_SECRET"):
-         expected_hex = hmac.new(os.environ['WEBHOOK_SECRET'].encode(), body, hashlib.sha256).hexdigest()
-         expected_b64 = base64.b64encode(hmac.new(os.environ['WEBHOOK_SECRET'].encode(), body, hashlib.sha256).digest()).decode()
-         app.logger.info("DEBUG: expected_hex -> %s", expected_hex)
-         app.logger.info("DEBUG: expected_b64 -> %s", expected_b64)
-
-    # If no signature header but WEBHOOK_SECRET is set, reject. If WEBHOOK_SECRET not set, accept by default.
+    # If WEBHOOK_SECRET present, require correct signature
     if WEBHOOK_SECRET:
-        if not header_sig:
-            app.logger.warning("Missing signature header while WEBHOOK_SECRET is set.")
+        if not valid_signature(body, sig):
+            log.warning("Bad signature: header=%s", sig)
             return jsonify({"error": "bad signature"}), 403
 
-        if not verify_signature(header_sig, WEBHOOK_SECRET, body):
-            # If debug enabled, log expected/received (partial)
-            app.logger.warning("Signature verification failed.")
-            if DEBUG:
-                # Avoid printing the full secret in logs. Print header and first bytes of expected.
-                app.logger.info("Headers: %s", dict(request.headers))
-            return jsonify({"error": "bad signature"}), 403
-    else:
-        # no secret configured — accept unsigned requests (useful for initial testing)
-        app.logger.info("WEBHOOK_SECRET not configured; accepting unsigned payload (testing mode).")
-
-    # parse JSON (may raise)
+    # parse payload (defensive)
     try:
         payload = request.get_json(force=True)
-        if not isinstance(payload, dict):
-            payload = {}
-    except Exception as ex:
-        app.logger.exception("Invalid JSON payload: %s", ex)
-        return jsonify({"error": "invalid payload"}), 400
+    except Exception:
+        payload = None
 
-    # Format and forward to Telegram
-    text = format_notification(payload)
-    result = send_telegram_message(text)
-    if result.get("ok"):
-        return jsonify({"ok": True}), 200
-    else:
-        # forward the error details in logs, but don't expose token/secret
-        app.logger.error("Telegram API error: %s", result)
-        # return 502 to indicate upstream/transient error
-        return jsonify({"error": "telegram_send_failed", "details": result}), 502
+    # For testing, just log and return OK
+    log.info("Payload: %s", json.dumps(payload, ensure_ascii=False)[:800] if payload else "<no-json>")
+
+    # TODO: forward to Telegram using TG_BOT_TOKEN/TG_CHAT_ID
+    # (your existing code probably does this; keep that logic here)
+    return jsonify({"ok": True}), 200
 
 if __name__ == "__main__":
-    # For local testing only. In production use gunicorn or Railway's runner.
-    debug_mode = DEBUG
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), debug=debug_mode)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)

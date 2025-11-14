@@ -1,0 +1,4 @@
+/root/tg-webhook/job_finder.py:205: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  print(f"[{datetime.utcnow().isoformat()}] Starting job check...")
+[2025-11-14T05:00:02.602093] Starting job check...
+No jobs fetched.

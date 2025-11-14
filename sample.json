@@ -1,10 +1,13 @@
 {
-  "title":"Webhook Test",
-  "company":"Railway",
-  "location":"Online",
-  "apply_link":"https://example.com",
-  "description":"Testing your webhook notification.",
-  "questions":[
-    {"q":"What is CEH?","a":"Certified Ethical Hacker"}
+  "title": "Webhook Test",
+  "company": "Railway",
+  "location": "Online",
+  "apply_link": "https://example.com",
+  "description": "Testing your webhook notification.",
+  "questions": [
+    {
+      "q": "What is CEH?",
+      "a": "Certified Ethical Hacker"
+    }
   ]
 }

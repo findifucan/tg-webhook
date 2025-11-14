@@ -151,25 +151,14 @@ def format_notification(payload: dict) -> str:
 
     # join with double newlines between main sections
     return "\n".join(parts)
-
-@app.route("/health", methods=["GET"])
 def health():
     return "ok", 200
 
 @app.route("/notify", methods=["POST"])
 def notify():
     # raw body bytes (important for signature verification)
-    # TEMP DEBUG: log exactly what we received and the expected HMAC (remove after debugging)
-    import hmac, hashlib
-    app.logger.info("DEBUG: received header X-Webhook-Signature -> %s", header_sig)
-
-    # compute expected hex and base64 to print (only for debug)
-    if os.environ.get("WEBHOOK_SECRET"):
-         expected_hex = hmac.new(os.environ['WEBHOOK_SECRET'].encode(), body, hashlib.sha256).hexdigest()
-         expected_b64 = base64.b64encode(hmac.new(os.environ['WEBHOOK_SECRET'].encode(), body, hashlib.sha256).digest()).decode()
-         app.logger.info("DEBUG: expected_hex -> %s", expected_hex)
-         app.logger.info("DEBUG: expected_b64 -> %s", expected_b64)
-
+    body = request.get_data()
+    header_sig = request.headers.get("X-Webhook-Signature") or request.headers.get("X-Webhook-Secret") or ""
     # If no signature header but WEBHOOK_SECRET is set, reject. If WEBHOOK_SECRET not set, accept by default.
     if WEBHOOK_SECRET:
         if not header_sig:

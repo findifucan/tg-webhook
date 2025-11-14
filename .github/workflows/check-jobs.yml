@@ -2,13 +2,12 @@ name: Job Finder (CEH fresher)
 
 on:
   schedule:
-  - cron: '0 */3 * * *'   # every 3 hours (UTC)
+    - cron: '0 */3 * * *'   # every 3 hours (UTC)
   workflow_dispatch: {}
 
 jobs:
   run-check:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4

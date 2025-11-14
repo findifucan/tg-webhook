@@ -1,77 +1,70 @@
-# telegram_webhook.py
-# Simple Flask app: /, /health, /notify
-# HMAC header expected in X-Webhook-Signature (raw hex)
-import os, hmac, hashlib, json, logging
-from flask import Flask, request, jsonify, abort
-
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("webhook")
+import os
+import hmac
+import hashlib
+import json
+import logging
+import requests
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
+log = logging.getLogger("webhook")
+logging.basicConfig(level=logging.INFO)
 
-# environment variables
-TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
+TG_CHAT_ID = os.getenv("TG_CHAT_ID")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").encode()
+
+
+def send_telegram(text):
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        log.error("Missing TG_BOT_TOKEN or TG_CHAT_ID")
+        return False
+
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    r = requests.post(url, data={"chat_id": TG_CHAT_ID, "text": text})
+    return r.status_code == 200
+
+
+def verify_signature(payload, header_sig):
+    """Verify hex HMAC SHA256 signature."""
+    if not header_sig:
+        return False
+
+    expected = hmac.new(WEBHOOK_SECRET, payload, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(header_sig, expected)
+
 
 @app.route("/", methods=["GET"])
 def index():
-    return (
-        "<h1>Job Finder Webhook</h1>"
-        "<p>Available endpoints: <b>/health</b>, <b>/notify</b> (POST)</p>"
-        "<p>Service is running.</p>",
-        200,
-    )
+    return "Webhook Ready", 200
+
 
 @app.route("/health", methods=["GET"])
 def health():
     return "ok", 200
 
-def valid_signature(body_bytes, sig_header):
-    if not WEBHOOK_SECRET:
-        # if secret not set, accept (useful for testing)
-        log.warning("WEBHOOK_SECRET not set in environment — skipping HMAC check")
-        return False if sig_header else True
-    # expected header: raw hex (64 chars)
-    try:
-        computed = hmac.new(WEBHOOK_SECRET.encode(), body_bytes, hashlib.sha256).hexdigest()
-        # accept raw hex (lowercase) OR "sha256="+hex
-        if sig_header is None:
-            return False
-        sig = sig_header.strip()
-        if sig == computed or sig.lower() == computed:
-            return True
-        if sig.startswith("sha256=") and sig.split("=",1)[1] == computed:
-            return True
-        return False
-    except Exception as e:
-        log.exception("signature check error")
-        return False
 
 @app.route("/notify", methods=["POST"])
 def notify():
-    body = request.get_data()  # raw bytes
-    sig = request.headers.get("X-Webhook-Signature")
-    log.info("Received /notify, sig=%s, len=%d", sig and sig[:8]+"...", len(body))
+    payload = request.data
+    header_sig = request.headers.get("X-Webhook-Signature")
 
-    # If WEBHOOK_SECRET present, require correct signature
-    if WEBHOOK_SECRET:
-        if not valid_signature(body, sig):
-            log.warning("Bad signature: header=%s", sig)
-            return jsonify({"error": "bad signature"}), 403
+    log.info(f"Received /notify, header_sig={header_sig}")
 
-    # parse payload (defensive)
+    if not verify_signature(payload, header_sig):
+        log.warning("Bad signature")
+        return jsonify({"error": "bad signature"}), 403
+
     try:
-        payload = request.get_json(force=True)
-    except Exception:
-        payload = None
+        data = json.loads(payload.decode())
+    except:
+        return jsonify({"error": "invalid json"}), 400
 
-    # For testing, just log and return OK
-    log.info("Payload: %s", json.dumps(payload, ensure_ascii=False)[:800] if payload else "<no-json>")
+    message = f"🔔 *New Job Update*\n\n" + json.dumps(data, indent=2)
+    send_telegram(message)
 
-    # TODO: forward to Telegram using TG_BOT_TOKEN/TG_CHAT_ID
-    # (your existing code probably does this; keep that logic here)
     return jsonify({"ok": True}), 200
 
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
+    app.run(host="0.0.0.0", port=5000)

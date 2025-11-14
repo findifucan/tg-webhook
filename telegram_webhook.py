@@ -46,23 +46,28 @@ def health():
 
 @app.route("/notify", methods=["POST"])
 def notify():
-    payload = request.data
+    payload = request.get_data() or b""
     header_sig = request.headers.get("X-Webhook-Signature")
+    # compute server-side HMAC (hex)
+    computed = hmac.new(WEBHOOK_SECRET, payload, hashlib.sha256).hexdigest() if WEBHOOK_SECRET else None
 
-    log.info(f"Received /notify, header_sig={header_sig}")
+    # VERY IMPORTANT: one log line that shows header and computed value (for debugging only)
+    log.info("DEBUG_SIG header=%s computed=%s len=%d", header_sig, computed and computed[:16] + "..." , len(payload))
 
-    if not verify_signature(payload, header_sig):
-        log.warning("Bad signature")
-        return jsonify({"error": "bad signature"}), 403
+    if WEBHOOK_SECRET:
+        if not header_sig or not hmac.compare_digest(header_sig, computed):
+            log.warning("Bad signature (rejecting)")
+            return jsonify({"error":"bad signature"}), 403
 
+    # parse payload
     try:
         data = json.loads(payload.decode())
-    except:
-        return jsonify({"error": "invalid json"}), 400
+    except Exception:
+        data = None
 
-    message = f"🔔 *New Job Update*\n\n" + json.dumps(data, indent=2)
-    send_telegram(message)
-
+    # build message (simple)
+    text = "*Webhook Received*\n" + (json.dumps(data, indent=2) if data else "<no-json>")
+    send_telegram(text)
     return jsonify({"ok": True}), 200
 
 

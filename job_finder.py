@@ -1,231 +1,265 @@
 #!/usr/bin/env python3
 """
-job_finder.py (updated: extracts likely direct apply links)
-- Multi-source: Indeed (RSS fallback), Naukri, Internshala (best-effort).
-- For each job found, fetch the job page and try to extract a direct 'apply' link.
-- Posts payload to WEBHOOK_URL with optional HMAC header X-Webhook-Signature.
+job_finder.py
+
+Purpose:
+  - Poll job feeds for CEH / cybersecurity fresher openings.
+  - Send newly-found jobs to a webhook (signed HMAC SHA256 raw-lower-hex).
+  - Keep a local seen list to avoid duplicate notifications.
+
+Usage:
+  - Set env vars: WEBHOOK_URL, WEBHOOK_SECRET
+  - Run manually: python3 job_finder.py
+  - Run in GitHub Actions (workflow provided earlier) or via cron.
+
+Notes:
+  - The script uses RSS/Atom feeds (feedparser). If an HTML page must be scraped, it will attempt to follow redirects and find links containing 'apply' or 'apply now'.
+  - Customize FEEDS list below for other job sources.
 """
-import os, json, time, hashlib, hmac, requests
-from datetime import datetime
+
+from __future__ import annotations
+import os
+import json
+import time
+import hmac
+import hashlib
+import logging
+from typing import List, Dict, Optional
+import feedparser
+import requests
 from bs4 import BeautifulSoup
+from datetime import datetime, timezone
 
-try:
-    import feedparser
-except Exception:
-    feedparser = None
+# ---- Configuration ----
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g. https://web-production-9ef7c3.up.railway.app/notify
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")  # must match Railway value
+SEEN_FILE = "seen_jobs.json"
+USER_AGENT = "job-finder-bot/1.0 (+https://example.com)"
+TIMEOUT = 12  # seconds for HTTP requests
 
-# CONFIG
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL") or "https://web-production-9ef7c3.up.railway.app/notify"
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-SEEN_FILE = os.path.join(os.path.dirname(__file__), "seen.json")
-USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
-HEADERS = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
+# Default feeds (you can add more). These are example Indeed RSS queries for India.
+# If any feed requires authentication or blocks scraping, add other feeds or APIs.
+FEEDS = [
+    # Indeed India search RSS for "CEH fresher cyber security" (example)
+    "https://in.indeed.com/rss?q=CEH+fresher+cyber+security&l=India",
+    # Generic Google Jobs / other provider RSS can be added here if available
+    # Add user-specific company job RSS URLs, Naukri/Monster RSS if available
+]
 
-INDEED_RSS = "https://in.indeed.com/rss?q=CEH+fresher+cyber+security&l=India"
-NAUKRI_SEARCH = "https://www.naukri.com/cyber-security-fresher-jobs-in-india"
-INTERNSHALA_SEARCH = "https://internshala.com/internships/it-software/internship"
+# Keywords to match as relevant to CEH/cybersecurity fresher roles
+KEYWORDS = [
+    "ceh", "certified ethical hacker", "fresher", "entry level", "junior", "trainee",
+    "cyber", "security", "information security", "infosec", "threat", "vulnerability",
+    "analyst", "soc", "penetration", "penetration tester", "security engineer"
+]
 
-def load_seen():
+# Fallback interview Q&A (used when no new jobs, or you can always send)
+FALLBACK_QA = [
+    {"q": "What is CEH and what topics does it cover?", "a": "CEH (Certified Ethical Hacker) covers penetration testing, network and web app exploitation, reconnaissance, vulnerability assessment, and countermeasures to think like an attacker."},
+    {"q": "Explain the difference between vulnerability assessment and penetration testing.", "a": "Vulnerability assessment finds and lists vulnerabilities (scanning). Penetration testing exploits vulnerabilities to demonstrate impact and prioritize fixes."},
+    {"q": "What is SQL injection and one way to prevent it?", "a": "SQL injection occurs when untrusted input is concatenated into SQL queries. Prevent with parameterized queries (prepared statements) and input validation."},
+    {"q": "What is XSS and its basic mitigation?", "a": "Cross-site scripting injects scripts into web pages. Mitigate by output-encoding, Content Security Policy, and proper input validation."},
+    {"q": "What is a SOC and what's a common task for a SOC analyst?", "a": "Security Operations Center (SOC) monitors and responds to security incidents. Analysts triage alerts, investigate logs, and escalate incidents."},
+]
+
+# ---- Logging ----
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("job_finder")
+
+# ---- Helpers ----
+
+def load_seen() -> Dict[str, float]:
     try:
-        with open(SEEN_FILE, "r") as f:
-            return set(json.load(f))
+        with open(SEEN_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
-        return set()
+        return {}
 
-def save_seen(s):
-    with open(SEEN_FILE, "w") as f:
-        json.dump(list(s), f)
+def save_seen(seen: Dict[str, float]) -> None:
+    with open(SEEN_FILE, "w", encoding="utf-8") as f:
+        json.dump(seen, f, indent=2)
 
-def compute_hmac(body_bytes, secret):
-    return hmac.new(secret.encode(), body_bytes, hashlib.sha256).hexdigest()
+def compute_hmac_hex(secret: str, body: bytes) -> str:
+    return hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
 
-def post_to_webhook(job):
-    payload = {
-        "title": job.get("title",""),
-        "company": job.get("company",""),
-        "location": job.get("location",""),
-        "apply_link": job.get("apply_link", job.get("link","")),
-        "description": job.get("summary",""),
-        "questions":[
-            {"q":"Why are you interested in this role?","a":"(Short personalized answer)"},
-            {"q":"Mention CEH topics you practiced.","a":"Nmap, Burp, SQLi, OSINT, SIEM basics."}
-        ]
+def send_signed_webhook(webhook_url: str, payload_obj: dict) -> tuple:
+    if not webhook_url:
+        raise RuntimeError("WEBHOOK_URL not set")
+    if not WEBHOOK_SECRET:
+        raise RuntimeError("WEBHOOK_SECRET not set")
+    # deterministic JSON bytes (no spaces)
+    body_bytes = json.dumps(payload_obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    sig_hex = compute_hmac_hex(WEBHOOK_SECRET, body_bytes)
+    headers = {
+        "Content-Type": "application/json",
+        "X-Webhook-Signature": sig_hex,
+        "User-Agent": USER_AGENT
     }
-    body = json.dumps(payload).encode("utf-8")
-    headers = {"Content-Type":"application/json"}
-    if WEBHOOK_SECRET:
-        headers["X-Webhook-Signature"] = compute_hmac(body, WEBHOOK_SECRET)
-    r = requests.post(WEBHOOK_URL, data=body, headers=headers, timeout=20)
-    return r
-
-def extract_apply_link(job_page_url):
-    """Open the job page and try heuristics to find an 'apply' link."""
     try:
-        r = requests.get(job_page_url, headers=HEADERS, timeout=12)
-        r.raise_for_status()
+        r = requests.post(webhook_url, data=body_bytes, headers=headers, timeout=20)
+        return r.status_code, r.text
+    except Exception as e:
+        return 0, f"exception:{e}"
+
+def short_summary(text: str, word_limit: int = 55) -> str:
+    words = text.replace("\n", " ").split()
+    if len(words) <= word_limit:
+        return " ".join(words)
+    return " ".join(words[:word_limit]) + "..."
+
+def looks_relevant(title: str, summary: str) -> bool:
+    combined = (title + " " + summary).lower()
+    for kw in KEYWORDS:
+        if kw in combined:
+            return True
+    return False
+
+def extract_apply_link(entry_link: str) -> str:
+    """
+    Try to return a direct apply link.
+    Strategy:
+     - Follow redirects (requests.get) and use final URL.
+     - If page HTML contains an anchor or button with 'apply' text, return its href.
+     - Otherwise return the feed's entry link.
+    """
+    try:
+        headers = {"User-Agent": USER_AGENT}
+        r = requests.get(entry_link, headers=headers, timeout=TIMEOUT, allow_redirects=True)
+        final = r.url
+        # parse HTML searching for links/buttons containing 'apply'
         html = r.text
-    except Exception:
-        return job_page_url  # fallback to original link
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    # 1) Common 'apply' button selectors
-    selectors = [
-        "a.apply, a.apply-now, a.applyBtn, a.apply-button, a.btn-apply, a#apply-button",
-        "a[href*='apply'], button.apply, button[id*='apply']",
-        "a[role='button'][href*='apply']",
-    ]
-    for sel in selectors:
-        el = soup.select_one(sel)
-        if el and el.get("href"):
-            href = el.get("href").strip()
-            if href.startswith("http"):
+        soup = BeautifulSoup(html, "html.parser")
+        # candidate anchors/buttons
+        for a in soup.find_all(["a", "button"]):
+            text = (a.get_text() or "").strip().lower()
+            href = a.get("href") or ""
+            if "apply" in text and href:
+                href = href.strip()
+                if href.startswith("/"):
+                    # make absolute
+                    from urllib.parse import urljoin
+                    href = urljoin(final, href)
                 return href
-            elif href.startswith("/"):
-                base = requests.utils.urlparse(job_page_url).scheme + "://" + requests.utils.urlparse(job_page_url).netloc
-                return base + href
+        # fallback to final URL
+        return final
+    except Exception as e:
+        logger.debug("extract_apply_link error for %s: %s", entry_link, e)
+        return entry_link
 
-    # 2) Look for form with action including 'apply' or 'submit'
-    form = soup.find("form", action=lambda a: a and ("apply" in a or "submit" in a))
-    if form:
-        action = form.get("action")
-        if action:
-            if action.startswith("http"):
-                return action
-            if action.startswith("/"):
-                base = requests.utils.urlparse(job_page_url).scheme + "://" + requests.utils.urlparse(job_page_url).netloc
-                return base + action
-            return job_page_url
+# ---- Main job fetch & notify ----
 
-    # 3) meta refresh or og:url or canonical
-    og = soup.find("meta", property="og:url")
-    if og and og.get("content"):
-        return og.get("content")
-    canon = soup.find("link", rel="canonical")
-    if canon and canon.get("href"):
-        return canon.get("href")
-
-    # 4) search for external application links (common providers)
-    for provider in ["meetanshi","apply.workable.com","lever.co","greenhouse","timesjobs","shrm","naukri.com","internshala.com","linkedin.com"]:
-        tag = soup.select_one(f"a[href*='{provider}']")
-        if tag and tag.get("href"):
-            return tag.get("href")
-
-    # no special apply link found — return original page
-    return job_page_url
-
-def parse_rss_feed(rss_url):
-    if not feedparser:
+def fetch_from_feed(url: str) -> List[dict]:
+    logger.info("Fetching feed: %s", url)
+    try:
+        parsed = feedparser.parse(url)
+    except Exception as e:
+        logger.warning("feedparser parse failed for %s: %s", url, e)
         return []
-    feed = feedparser.parse(rss_url)
-    jobs = []
-    for e in feed.entries:
-        link = e.get("link")
-        title = e.get("title","Job")
-        summary = e.get("summary","")
-        job_id = hashlib.sha256((link or title).encode()).hexdigest()[:16]
-        jobs.append({"id":job_id,"title":title,"company":e.get("author",""),"location":"","link":link,"summary":summary})
-    return jobs
 
-def parse_naukri():
-    try:
-        r = requests.get(NAUKRI_SEARCH, headers=HEADERS, timeout=12)
-        r.raise_for_status()
-    except Exception:
-        return []
-    soup = BeautifulSoup(r.text, "html.parser")
-    jobs = []
-    for card in soup.select("article.jobTuple, div.jobTuple")[:40]:
+    items = []
+    for entry in parsed.entries[:50]:  # limit to recent 50
+        job = {}
+        job_id = entry.get("id") or entry.get("guid") or entry.get("link") or entry.get("title")
+        job["id"] = str(job_id)
+        job["title"] = entry.get("title", "").strip()
+        job["link"] = entry.get("link", "").strip()
+        job["summary"] = entry.get("summary", entry.get("description", "")).strip()
+        # try to get company/location if provided in feed
+        job["company"] = entry.get("company") or ""
+        job["location"] = entry.get("location") or entry.get("author") or ""
+        # published time
         try:
-            a = card.find("a", href=True)
-            href = a.get("href") if a else None
-            if not href:
-                continue
-            link = href if href.startswith("http") else "https://www.naukri.com" + href
-            title = (card.select_one("a.title") or card.select_one("h2") or card).get_text(strip=True)
-            company = (card.select_one(".company") or card.select_one(".companyInfo .subTitle") or "").get_text(strip=True)
-            job_id = hashlib.sha256(link.encode()).hexdigest()[:16]
-            jobs.append({"id":job_id,"title":title,"company":company,"location":"","link":link,"summary":""})
+            if "published_parsed" in entry and entry.published_parsed:
+                job["published"] = int(time.mktime(entry.published_parsed))
         except Exception:
-            continue
-    return jobs
+            job["published"] = int(time.time())
+        items.append(job)
+    return items
 
-def parse_internshala():
-    try:
-        r = requests.get(INTERNSHALA_SEARCH, headers=HEADERS, timeout=12)
-        r.raise_for_status()
-    except Exception:
-        return []
-    soup = BeautifulSoup(r.text, "html.parser")
-    jobs = []
-    for card in soup.select("div.internship_meta, div.item, div.internship")[:40]:
-        try:
-            title_tag = card.select_one("a.profile") or card.select_one(".heading_4_5")
-            title = title_tag.get_text(strip=True) if title_tag else card.get_text(" ", strip=True)[:80]
-            if "cyber" not in title.lower() and "security" not in title.lower():
-                continue
-            link_tag = card.find("a", href=True)
-            href = link_tag.get("href") if link_tag else None
-            if not href:
-                continue
-            link = "https://internshala.com" + href if href.startswith("/") else href
-            job_id = hashlib.sha256(link.encode()).hexdigest()[:16]
-            jobs.append({"id":job_id,"title":title,"company":"","location":"","link":link,"summary":""})
-        except Exception:
-            continue
-    return jobs
+def build_payload_from_job(job: dict) -> dict:
+    title = job.get("title", "No title")
+    company = job.get("company", "") or ""
+    loc = job.get("location", "") or ""
+    link = job.get("link", "")
+    # attempt to find a direct apply link
+    apply_link = extract_apply_link(link) if link else ""
+    summary = short_summary(job.get("summary", ""), word_limit=55)
+    # Build 50-60 word short description: try to keep concise
+    desc = summary
+    # sample interview Q&A per job (can be enhanced using job role detection)
+    sample_q = [
+        {"q": "What is CEH?", "a": "CEH means Certified Ethical Hacker — focus on penetration testing, info-gathering, and defensive controls."},
+        {"q": "How would you perform a basic network scan?", "a": "Use Nmap to discover hosts/open ports, then map services and versions for further testing."},
+    ]
+    payload = {
+        "title": title,
+        "company": company,
+        "location": loc,
+        "apply_link": apply_link,
+        "description": desc,
+        "questions": sample_q,
+        "source": "feed",
+        "fetched_at": datetime.now(timezone.utc).isoformat()
+    }
+    return payload
 
-def fetch_jobs():
-    jobs = []
-    # Indeed RSS first (reliable)
-    if feedparser:
-        try:
-            jobs = parse_rss_feed(INDEED_RSS)
-            if jobs:
-                return jobs
-        except Exception:
-            pass
-    # Naukri fallback
-    try:
-        naukri = parse_naukri()
-        if naukri:
-            return naukri
-    except Exception:
-        pass
-    # Internshala fallback
-    try:
-        intern = parse_internshala()
-        if intern:
-            return intern
-    except Exception:
-        pass
-    return jobs
+def find_jobs_and_notify():
+    if not WEBHOOK_URL or not WEBHOOK_SECRET:
+        logger.error("WEBHOOK_URL or WEBHOOK_SECRET not set; aborting.")
+        return
 
-def main():
-    print(f"[{datetime.utcnow().isoformat()}] Starting job check...")
     seen = load_seen()
-    jobs = fetch_jobs()
-    if not jobs:
-        print("No jobs fetched.")
-        return
-    new = [j for j in jobs if j["id"] not in seen]
-    if not new:
-        print("No new jobs.")
-        return
-    for j in new[:15]:
-        print("Resolving apply link for:", j.get("title"), j.get("link"))
-        try:
-            apply_link = extract_apply_link(j.get("link"))
-            j["apply_link"] = apply_link
-            r = post_to_webhook(j)
-            print("Posted:", r.status_code, r.text)
-            if r.status_code == 200:
-                seen.add(j["id"])
-        except Exception as e:
-            print("Post error:", e)
-        time.sleep(2)
-    save_seen(seen)
-    print("Done.")
+    new_seen = dict(seen)
+    any_sent = False
+    found_jobs = []
 
+    for feed in FEEDS:
+        items = fetch_from_feed(feed)
+        for job in items:
+            jid = job["id"]
+            if not jid:
+                continue
+            if jid in seen:
+                continue
+            # check relevance
+            if not looks_relevant(job.get("title", ""), job.get("summary", "")):
+                # skip if not matching keywords
+                continue
+            # Build payload and send
+            payload = build_payload_from_job(job)
+            status, text = send_signed_webhook(WEBHOOK_URL, payload)
+            logger.info("Sent job %s -> status=%s", jid, status)
+            if status == 200:
+                any_sent = True
+                new_seen[jid] = time.time()
+                found_jobs.append({"id": jid, "title": job.get("title")})
+            else:
+                logger.warning("Failed to send job %s status=%s body=%s", jid, status, text)
+
+    # Save updated seen list
+    if new_seen != seen:
+        save_seen(new_seen)
+
+    # If no new jobs found and you want fallback Q&A, send one message (optional)
+    if not any_sent:
+        logger.info("No new jobs found; sending fallback interview Q&A.")
+        fallback_payload = {
+            "title": "No new CEH fresher jobs found — study Q&A",
+            "company": "",
+            "location": "",
+            "apply_link": "",
+            "description": "No fresh roles found this run. Here are important interview questions to practice.",
+            "questions": FALLBACK_QA,
+            "source": "fallback",
+            "fetched_at": datetime.now(timezone.utc).isoformat()
+        }
+        status, text = send_signed_webhook(WEBHOOK_URL, fallback_payload)
+        logger.info("Fallback Q&A sent -> status=%s", status)
+
+# ---- CLI ----
 if __name__ == "__main__":
-    main()
+    logger.info("Starting job_finder run")
+    try:
+        find_jobs_and_notify()
+    except Exception as exc:
+        logger.exception("Unhandled exception in job_finder: %s", exc)
